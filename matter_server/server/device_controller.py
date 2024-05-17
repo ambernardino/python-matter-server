@@ -13,11 +13,12 @@ from random import randint
 import time
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-from chip.clusters import Attribute, Objects as Clusters
+from chip.clusters import Attribute, Objects as Clusters, Types
 from chip.clusters.Attribute import ValueDecodeFailure
 from chip.clusters.ClusterObjects import ALL_ATTRIBUTES, ALL_CLUSTERS, Cluster
 from chip.discovery import DiscoveryType
 from chip.exceptions import ChipStackError
+from chip.interaction_model import Status
 from zeroconf import BadTypeInNameException, IPVersion, ServiceStateChange, Zeroconf
 from zeroconf.asyncio import AsyncServiceBrowser, AsyncServiceInfo, AsyncZeroconf
 
@@ -138,7 +139,7 @@ class MatterDeviceController:
         self._node_lock: dict[int, asyncio.Lock] = {}
         self._ota_provider: ExternalOtaProvider | None = None
 
-    async def initialize(self, paa_root_cert_dir: Path) -> None:
+    async def initialize(self, paa_root_cert_dir: Path, ota_provider_dir: Path) -> None:
         """Async initialize of controller."""
         # (re)fetch all PAA certificates once at startup
         # NOTE: this must be done before initializing the controller
@@ -152,7 +153,8 @@ class MatterDeviceController:
             int, await self._call_sdk(self.chip_controller.GetCompressedFabricId)
         )
         self.fabric_id_hex = hex(self.compressed_fabric_id)[2:]
-        self._ota_provider = ExternalOtaProvider()
+        self._ota_provider = ExternalOtaProvider(ota_provider_dir)
+        await self._ota_provider.initialize()
         LOGGER.debug("CHIP Device Controller Initialized")
 
     async def start(self) -> None:
@@ -959,17 +961,94 @@ class MatterDeviceController:
         # Add to OTA provider
         await self._ota_provider.download_update(update)
 
+        ota_provider_node_id = self._ota_provider.get_node_id()
+        if ota_provider_node_id not in self._nodes:
+            LOGGER.warning(
+                "OTA Provider node id %d no longer exists! Resetting...",
+                ota_provider_node_id,
+            )
+            await self._ota_provider.reset()
+            ota_provider_node_id = None
+
+        # Make sure any previous instances get stopped
+        await self._ota_provider.stop()
         self._ota_provider.start()
 
         # Wait for OTA provider to be ready
         # TODO: Detect when OTA provider is ready
         await asyncio.sleep(2)
 
+        if not ota_provider_node_id:
+            # The OTA Provider has not been commissioned yet, let's do it now.
+            LOGGER.info("Commissioning the built-in OTA Provider App.")
+            try:
+                ota_provider_node = await self.commission_on_network(
+                    self._ota_provider.get_passcode(),
+                    # TODO: Filtering by long discriminator seems broken
+                    # filter_type=FilterType.LONG_DISCRIMINATOR,
+                    # filter=self._ota_provider.get_descriminator(),
+                )
+                ota_provider_node_id = ota_provider_node.node_id
+            except NodeCommissionFailed:
+                LOGGER.error("Failed to commission OTA Provider App!")
+                return None
+            LOGGER.info(
+                "OTA Provider App commissioned with node id %d.",
+                ota_provider_node_id,
+            )
+
+            # Adjust ACL of OTA Requestor such that Node peer-to-peer communication
+            # is allowed.
+            try:
+                read_result = await self.chip_controller.ReadAttribute(
+                    ota_provider_node_id, [(0, Clusters.AccessControl.Attributes.Acl)]
+                )
+                acl_list = cast(
+                    list,
+                    read_result[0][Clusters.AccessControl][
+                        Clusters.AccessControl.Attributes.Acl
+                    ],
+                )
+
+                # Add new ACL entry...
+                acl_list.append(
+                    Clusters.AccessControl.Structs.AccessControlEntryStruct(
+                        fabricIndex=1,
+                        privilege=3,
+                        authMode=2,
+                        subjects=Types.NullValue,
+                        targets=[
+                            Clusters.AccessControl.Structs.AccessControlTargetStruct(
+                                cluster=41, endpoint=0, deviceType=Types.NullValue
+                            )
+                        ],
+                    )
+                )
+
+                # And write. This is persistent, so only need to be done after we commissioned
+                # the OTA Provider App.
+                write_result: Attribute.AttributeWriteResult = (
+                    await self.chip_controller.WriteAttribute(
+                        ota_provider_node_id,
+                        [(0, Clusters.AccessControl.Attributes.Acl(acl_list))],
+                    )
+                )
+                if write_result[0].Status != Status.Success:
+                    logging.error("Failed writing adjusted OTA Provider App ACL.")
+                    await self.remove_node(ota_provider_node_id)
+                    return None
+            except ChipStackError as ex:
+                logging.exception("Failed adjusting OTA Provider App ACL.", exc_info=ex)
+                await self.remove_node(ota_provider_node_id)
+            else:
+                self._ota_provider.set_node_id(ota_provider_node_id)
+
+        # Notify node about the new update!
         await self.chip_controller.SendCommand(
             nodeid=node_id,
             endpoint=0,
             payload=Clusters.OtaSoftwareUpdateRequestor.Commands.AnnounceOTAProvider(
-                providerNodeID=32,
+                providerNodeID=ota_provider_node_id,
                 vendorID=0,  # TODO: Use Server Vendor ID
                 announcementReason=Clusters.OtaSoftwareUpdateRequestor.Enums.AnnouncementReasonEnum.kUpdateAvailable,
                 endpoint=0,
