@@ -41,8 +41,12 @@ async def check_updates(
 
         software_versions: list[int] = versions["modelVersions"]["softwareVersions"]
         latest_software_version = max(software_versions)
+
+        # Check if the software is indeed newer
         if latest_software_version <= current_software_version:
             return None
+
+        # TODO: Check minApplicableSoftwareVersion/maxApplicableSoftwareVersion
 
         version: dict = await get_software_version(
             node_id, vid, pid, latest_software_version
