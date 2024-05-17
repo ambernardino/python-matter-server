@@ -26,6 +26,7 @@ from matter_server.common.models import CommissionableNodeData, CommissioningPar
 from matter_server.server.helpers.attributes import parse_attributes_from_read_result
 from matter_server.server.helpers.utils import ping_ip
 from matter_server.server.ota.dcl import check_updates
+from matter_server.server.ota.provider import ExternalOtaProvider
 
 from ..common.errors import (
     InvalidArguments,
@@ -135,6 +136,7 @@ class MatterDeviceController:
         self._node_setup_throttle = asyncio.Semaphore(5)
         self._mdns_event_timer: dict[str, asyncio.TimerHandle] = {}
         self._node_lock: dict[int, asyncio.Lock] = {}
+        self._ota_provider: ExternalOtaProvider | None = None
 
     async def initialize(self, paa_root_cert_dir: Path) -> None:
         """Async initialize of controller."""
@@ -150,6 +152,7 @@ class MatterDeviceController:
             int, await self._call_sdk(self.chip_controller.GetCompressedFabricId)
         )
         self.fabric_id_hex = hex(self.compressed_fabric_id)[2:]
+        self._ota_provider = ExternalOtaProvider()
         LOGGER.debug("CHIP Device Controller Initialized")
 
     async def start(self) -> None:
@@ -937,6 +940,9 @@ class MatterDeviceController:
             )
 
             # Add to OTA provider
+            if not self._ota_provider:
+                return None
+            await self._ota_provider.download_update(update)
 
         return update
 
